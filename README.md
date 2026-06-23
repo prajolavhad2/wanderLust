@@ -155,7 +155,7 @@ wanderLust/
 
 Use these test card details for Razorpay:
 
-- **Card Number:** `4111 1111 1111 1111`
+- **Card Number:** `5267 3181 8797 5449`
 - **Expiry:** Any future date
 - **CVV:** Any 3 digits
 
