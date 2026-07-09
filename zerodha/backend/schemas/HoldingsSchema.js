@@ -1,5 +1,7 @@
-const { Schema } = reuire("mongoose");
-const HoldingSchema = new schema({
+const { Schema } = require("mongoose");
+
+const HoldingsSchema = new Schema({
+  user: { type: Schema.Types.ObjectId, ref: "user", required: true },
   name: String,
   qty: Number,
   avg: Number,
@@ -8,4 +10,4 @@ const HoldingSchema = new schema({
   day: String,
 });
 
-module.exports = { HoldingSchema };
+module.exports = { HoldingsSchema };
