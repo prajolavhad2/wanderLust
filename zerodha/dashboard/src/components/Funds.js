@@ -37,7 +37,7 @@ const Funds = () => {
         key: process.env.REACT_APP_RAZORPAY_KEY_ID,
         amount: order.amount,
         currency: order.currency,
-        name: "Zerodha Clone",
+        name: "TradeVista Clone",
         description: "Add funds to wallet",
         order_id: order.id,
         handler: async (response) => {

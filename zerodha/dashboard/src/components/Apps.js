@@ -17,7 +17,7 @@ const Apps = () => {
         }}
       >
         <div>
-          <h4 style={{ margin: "0 0 6px" }}>Zerodha Website</h4>
+          <h4 style={{ margin: "0 0 6px" }}>TradeVista Website</h4>
           <p style={{ margin: 0, color: "#888", fontSize: "0.85rem" }}>
             Visit our main website to learn more.
           </p>
