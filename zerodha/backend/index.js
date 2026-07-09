@@ -5,6 +5,7 @@ const mongoose = require("mongoose");
 const session = require("express-session");
 const { MongoStore } = require("connect-mongo");
 const helmet = require("helmet");
+const morgan = require("morgan");
 const crypto = require("crypto");
 const { HoldingsModel } = require("./model/HoldingsModel");
 const { PositionsModel } = require("./model/PositionsModel");
@@ -13,7 +14,14 @@ const { UserModel } = require("./model/UserModel");
 const passport = require("./config/passport");
 const razorpayInstance = require("./config/razorpay");
 const { ensureAuthenticated, authorize } = require("./middleware/auth");
-const { authLimiter } = require("./middleware/rateLimiter");
+const { authLimiter, generalLimiter } = require("./middleware/rateLimiter");
+const {
+  validateNewOrder,
+  validateRegister,
+  validateLogin,
+  validateFundsAmount,
+} = require("./middleware/validators");
+const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 
@@ -23,6 +31,7 @@ const URL = process.env.MONGO_URL;
 const app = express();
 
 app.use(helmet());
+app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 app.use(
   cors({
@@ -31,6 +40,7 @@ app.use(
   }),
 );
 app.use(bodyParser.json());
+app.use(generalLimiter);
 
 app.use(
   session({
@@ -52,29 +62,35 @@ app.use(passport.session());
 
 // ---------- AUTH ROUTES ----------
 
-app.post("/auth/register", authLimiter, async (req, res) => {
-  const { email, password, username } = req.body;
+app.post(
+  "/auth/register",
+  authLimiter,
+  validateRegister,
+  async (req, res, next) => {
+    const { email, password, username } = req.body;
 
-  if (!password || password.length < 8) {
-    return res.status(400).send("Password must be at least 8 characters long");
-  }
+    try {
+      await UserModel.register(new UserModel({ username, email }), password);
+      res.json({ message: "Registration successful" });
+    } catch (err) {
+      if (
+        err.name === "UserExistsError" ||
+        err.message.includes("already exists")
+      ) {
+        return res.status(400).send(err.message);
+      }
+      next(err);
+    }
+  },
+);
 
-  try {
-    await UserModel.register(new UserModel({ username, email }), password);
-    res.json({ message: "Registration successful" });
-  } catch (err) {
-    console.error(err);
-    res.status(400).send(err.message || "Registration failed");
-  }
-});
-
-app.post("/auth/login", authLimiter, (req, res, next) => {
+app.post("/auth/login", authLimiter, validateLogin, (req, res, next) => {
   passport.authenticate("local", (err, user, info) => {
-    if (err) return res.status(500).send("Something went wrong");
+    if (err) return next(err);
     if (!user) return res.status(401).send(info?.message || "Login failed");
 
     req.login(user, (err) => {
-      if (err) return res.status(500).send("Login failed");
+      if (err) return next(err);
       res.json({
         email: user.email,
         username: user.username,
@@ -85,9 +101,9 @@ app.post("/auth/login", authLimiter, (req, res, next) => {
   })(req, res, next);
 });
 
-app.get("/auth/logout", (req, res) => {
+app.get("/auth/logout", (req, res, next) => {
   req.logout((err) => {
-    if (err) return res.status(500).send("Logout failed");
+    if (err) return next(err);
     req.session.destroy(() => {
       res.clearCookie("connect.sid");
       res.send("Logged out");
@@ -110,12 +126,16 @@ app.get("/auth/current-user", (req, res) => {
 
 // ---------- HOLDINGS & ORDERS (user-scoped) ----------
 
-app.get("/allHoldings", ensureAuthenticated, async (req, res) => {
-  const allHoldings = await HoldingsModel.find({ user: req.user._id });
-  res.json(allHoldings);
+app.get("/allHoldings", ensureAuthenticated, async (req, res, next) => {
+  try {
+    const allHoldings = await HoldingsModel.find({ user: req.user._id });
+    res.json(allHoldings);
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.get("/allPositions", ensureAuthenticated, async (req, res) => {
+app.get("/allPositions", ensureAuthenticated, async (req, res, next) => {
   try {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
@@ -179,95 +199,102 @@ app.get("/allPositions", ensureAuthenticated, async (req, res) => {
 
     res.json(positions);
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Something went wrong");
+    next(err);
   }
 });
 
-app.post("/newOrder", ensureAuthenticated, async (req, res) => {
-  const { name, qty, price, mode } = req.body;
-  const orderQty = Number(qty);
-  const orderPrice = Number(price);
-  const userId = req.user._id;
-  const orderTotal = orderQty * orderPrice;
+app.post(
+  "/newOrder",
+  ensureAuthenticated,
+  validateNewOrder,
+  async (req, res, next) => {
+    const { name, qty, price, mode } = req.body;
+    const orderQty = Number(qty);
+    const orderPrice = Number(price);
+    const userId = req.user._id;
+    const orderTotal = orderQty * orderPrice;
 
-  try {
-    const user = await UserModel.findById(userId);
-    const existingHolding = await HoldingsModel.findOne({
-      name,
-      user: userId,
-    });
+    try {
+      const user = await UserModel.findById(userId);
+      const existingHolding = await HoldingsModel.findOne({
+        name,
+        user: userId,
+      });
 
-    if (mode === "BUY") {
-      if (user.balance < orderTotal) {
-        return res.status(400).send("Insufficient funds to place this order");
+      if (mode === "BUY") {
+        if (user.balance < orderTotal) {
+          return res.status(400).send("Insufficient funds to place this order");
+        }
+
+        if (existingHolding) {
+          const totalCost =
+            existingHolding.avg * existingHolding.qty + orderPrice * orderQty;
+          const totalQty = existingHolding.qty + orderQty;
+
+          existingHolding.qty = totalQty;
+          existingHolding.avg = totalCost / totalQty;
+          existingHolding.price = orderPrice;
+          await existingHolding.save();
+        } else {
+          const newHolding = new HoldingsModel({
+            user: userId,
+            name,
+            qty: orderQty,
+            avg: orderPrice,
+            price: orderPrice,
+            net: "0.00%",
+            day: "0.00%",
+          });
+          await newHolding.save();
+        }
+
+        user.balance -= orderTotal;
+        await user.save();
+      } else if (mode === "SELL") {
+        if (!existingHolding || existingHolding.qty < orderQty) {
+          return res.status(400).send("Not enough quantity to sell");
+        }
+
+        const remainingQty = existingHolding.qty - orderQty;
+
+        if (remainingQty === 0) {
+          await HoldingsModel.deleteOne({ name, user: userId });
+        } else {
+          existingHolding.qty = remainingQty;
+          existingHolding.price = orderPrice;
+          await existingHolding.save();
+        }
+
+        user.balance += orderTotal;
+        await user.save();
       }
 
-      if (existingHolding) {
-        const totalCost =
-          existingHolding.avg * existingHolding.qty + orderPrice * orderQty;
-        const totalQty = existingHolding.qty + orderQty;
+      const newOrder = new OrdersModel({
+        user: userId,
+        name,
+        qty: orderQty,
+        price: orderPrice,
+        mode,
+      });
+      await newOrder.save();
 
-        existingHolding.qty = totalQty;
-        existingHolding.avg = totalCost / totalQty;
-        existingHolding.price = orderPrice;
-        await existingHolding.save();
-      } else {
-        const newHolding = new HoldingsModel({
-          user: userId,
-          name,
-          qty: orderQty,
-          avg: orderPrice,
-          price: orderPrice,
-          net: "0.00%",
-          day: "0.00%",
-        });
-        await newHolding.save();
-      }
-
-      user.balance -= orderTotal;
-      await user.save();
-    } else if (mode === "SELL") {
-      if (!existingHolding || existingHolding.qty < orderQty) {
-        return res.status(400).send("Not enough quantity to sell");
-      }
-
-      const remainingQty = existingHolding.qty - orderQty;
-
-      if (remainingQty === 0) {
-        await HoldingsModel.deleteOne({ name, user: userId });
-      } else {
-        existingHolding.qty = remainingQty;
-        existingHolding.price = orderPrice;
-        await existingHolding.save();
-      }
-
-      user.balance += orderTotal;
-      await user.save();
+      res.send("Order Placed");
+    } catch (err) {
+      next(err);
     }
+  },
+);
 
-    const newOrder = new OrdersModel({
-      user: userId,
-      name,
-      qty: orderQty,
-      price: orderPrice,
-      mode,
-    });
-    await newOrder.save();
-
-    res.send("Order Placed");
+app.get("/allOrders", ensureAuthenticated, async (req, res, next) => {
+  try {
+    const allOrders = await OrdersModel.find({ user: req.user._id });
+    res.json(allOrders);
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Something went wrong");
+    next(err);
   }
 });
 
-app.get("/allOrders", ensureAuthenticated, async (req, res) => {
-  const allOrders = await OrdersModel.find({ user: req.user._id });
-  res.json(allOrders);
-});
-
-app.delete("/deleteOrder/:id", ensureAuthenticated, async (req, res) => {
+app.delete("/deleteOrder/:id", ensureAuthenticated, async (req, res, next) => {
   try {
     const order = await OrdersModel.findOne({
       _id: req.params.id,
@@ -321,22 +348,16 @@ app.delete("/deleteOrder/:id", ensureAuthenticated, async (req, res) => {
     await OrdersModel.findByIdAndDelete(req.params.id);
     res.send("Order deleted");
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Something went wrong");
+    next(err);
   }
 });
 
 // ---------- FUNDS ----------
 
-app.get("/funds", ensureAuthenticated, async (req, res) => {
+app.get("/funds", ensureAuthenticated, async (req, res, next) => {
   try {
     const user = await UserModel.findById(req.user._id);
     const holdings = await HoldingsModel.find({ user: req.user._id });
-
-    if (user.balance === undefined || user.balance === null) {
-      user.balance = 100000;
-      await user.save();
-    }
 
     const usedMargin = holdings.reduce(
       (sum, stock) => sum + stock.avg * stock.qty,
@@ -349,87 +370,89 @@ app.get("/funds", ensureAuthenticated, async (req, res) => {
       total: user.balance + usedMargin,
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Something went wrong");
+    next(err);
   }
 });
 
-app.post("/funds/create-order", ensureAuthenticated, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    const numAmount = Number(amount);
+app.post(
+  "/funds/create-order",
+  ensureAuthenticated,
+  validateFundsAmount,
+  async (req, res, next) => {
+    try {
+      const { amount } = req.body;
+      const numAmount = Number(amount);
 
-    if (!numAmount || numAmount <= 0) {
-      return res.status(400).send("Enter a valid amount");
+      const options = {
+        amount: Math.round(numAmount * 100),
+        currency: "INR",
+        receipt: `receipt_${Date.now()}`,
+      };
+
+      const order = await razorpayInstance.orders.create(options);
+      res.json(order);
+    } catch (err) {
+      next(err);
     }
+  },
+);
 
-    const options = {
-      amount: Math.round(numAmount * 100),
-      currency: "INR",
-      receipt: `receipt_${Date.now()}`,
-    };
+app.post(
+  "/funds/verify-payment",
+  ensureAuthenticated,
+  async (req, res, next) => {
+    try {
+      const {
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+        amount,
+      } = req.body;
 
-    const order = await razorpayInstance.orders.create(options);
-    res.json(order);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Something went wrong creating the payment order");
-  }
-});
+      const generatedSignature = crypto
+        .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+        .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+        .digest("hex");
 
-app.post("/funds/verify-payment", ensureAuthenticated, async (req, res) => {
-  try {
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      amount,
-    } = req.body;
+      if (generatedSignature !== razorpay_signature) {
+        return res.status(400).send("Payment verification failed");
+      }
 
-    const generatedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest("hex");
+      const user = await UserModel.findById(req.user._id);
+      user.balance += Number(amount);
+      await user.save();
 
-    if (generatedSignature !== razorpay_signature) {
-      return res.status(400).send("Payment verification failed");
+      res.json({ balance: user.balance });
+    } catch (err) {
+      next(err);
     }
+  },
+);
 
-    const user = await UserModel.findById(req.user._id);
-    user.balance += Number(amount);
-    await user.save();
+app.post(
+  "/funds/withdraw",
+  ensureAuthenticated,
+  validateFundsAmount,
+  async (req, res, next) => {
+    try {
+      const { amount } = req.body;
+      const numAmount = Number(amount);
 
-    res.json({ balance: user.balance });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Something went wrong verifying payment");
-  }
-});
+      const user = await UserModel.findById(req.user._id);
 
-app.post("/funds/withdraw", ensureAuthenticated, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    const numAmount = Number(amount);
+      if (user.balance < numAmount) {
+        return res.status(400).send("Insufficient balance to withdraw");
+      }
 
-    if (!numAmount || numAmount <= 0) {
-      return res.status(400).send("Enter a valid amount");
+      user.balance -= numAmount;
+      await user.save();
+
+      res.json({ balance: user.balance });
+    } catch (err) {
+      next(err);
     }
-
-    const user = await UserModel.findById(req.user._id);
-
-    if (user.balance < numAmount) {
-      return res.status(400).send("Insufficient balance to withdraw");
-    }
-
-    user.balance -= numAmount;
-    await user.save();
-
-    res.json({ balance: user.balance });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Something went wrong");
-  }
-});
+  },
+);
 
 // ---------- ADMIN ----------
 
@@ -437,15 +460,20 @@ app.delete(
   "/admin/deleteUser/:id",
   ensureAuthenticated,
   authorize("admin"),
-  async (req, res) => {
+  async (req, res, next) => {
     try {
       await UserModel.findByIdAndDelete(req.params.id);
       res.send("User deleted");
     } catch (err) {
-      res.status(500).send("Something went wrong");
+      next(err);
     }
   },
 );
+
+// ---------- 404 + ERROR HANDLING (must be last) ----------
+
+app.use(notFoundHandler);
+app.use(errorHandler);
 
 app.listen(PORT, () => {
   console.log("App Started");
