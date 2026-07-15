@@ -2,7 +2,7 @@
 
 A full-stack Airbnb-inspired travel listing platform built with Node.js, Express, MongoDB, and EJS.
 
-🌐 **Live Demo:** [wanderlust on Render](https://wanderlust-YOURURL.onrender.com)
+🌐 **Live Demo:** [wanderlust on Render]https://wanderlust-i4cj.onrender.com/listings
 
 ---
 
@@ -155,7 +155,7 @@ wanderLust/
 
 Use these test card details for Razorpay:
 
-- **Card Number:** `4111 1111 1111 1111`
+- **Card Number:** `5267 3181 8797 5449`
 - **Expiry:** Any future date
 - **CVV:** Any 3 digits
 
